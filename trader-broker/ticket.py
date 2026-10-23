@@ -176,6 +176,116 @@ def tool_input(order):
     return out
 
 
+# ---------------------------------------------------------------- MetaTrader 5
+
+MT5_POS_ID = "<id of the new position, from step 2>"
+MT5_HELD_ID = "<id of the open position, from step 1>"
+
+
+def is_mt5(cfg):
+    return str(cfg.get("broker", "alpaca")).lower() in ("mt5", "metatrader", "metatrader5")
+
+
+def broker_name(cfg):
+    b = str(cfg.get("broker", "alpaca")).lower()
+    if b == "ibkr":
+        return "Interactive Brokers"
+    if is_mt5(cfg):
+        return "MetaTrader 5"
+    return "Alpaca"
+
+
+def mt5_symbol(order, cfg):
+    sym = str(order.get("symbol", "")).upper()
+    return str(((cfg.get("mt5") or {}).get("symbol_map") or {}).get(sym, sym))
+
+
+def mt5_volume(qty, cfg):
+    """(lots, problem). Shares become lots with the symbol's contract size.
+    The volume must land exactly on the broker's step: rounding it would change
+    the max loss trader-risk checked, so a mismatch is a problem, not a rounding."""
+    m = cfg.get("mt5") or {}
+    size = _f(m.get("contract_size"))
+    if not size or size <= 0:
+        return None, ("set \"mt5\": {\"contract_size\": N} in the config: the shares in one lot for this "
+                      "symbol (MetaTrader: right-click the symbol, Specification, Contract size)")
+    step = _f(m.get("volume_step")) or 0.01
+    vmin = _f(m.get("volume_min")) or step
+    q = _f(qty)
+    if not q or q <= 0:
+        return None, "MetaTrader needs a share count (qty), not a dollar amount"
+    lots = q / size
+    n = round(lots / step)
+    if abs(n * step - lots) > 1e-9:
+        ok = n * step * size
+        return None, ("%s shares = %s lots, not a multiple of the %s-lot step; %s shares would fit"
+                      % (_str_num(q), _str_num(round(lots, 8)), _str_num(step), _str_num(round(ok, 8))))
+    lots = round(n * step, 8)
+    if lots + 1e-12 < vmin:
+        return None, "%s lots is under the %s-lot minimum" % (_str_num(lots), _str_num(vmin))
+    return lots, None
+
+
+def mt5_steps(order, cfg, kind=None):
+    """(steps, problem). The exact MetaTrader tool calls for one approved order.
+
+    Entries: a limit or stop entry is one place_pending_order carrying the
+    stop-loss and take-profit. A market entry is place_market_order, then the
+    position id, then modify_position with the stop and the target, at once.
+    Exits never send a SELL: on MetaTrader a SELL with nothing to close opens a
+    short. They close the position by id instead."""
+    side = str(order.get("side", "")).lower()
+    typ = str(order.get("type", "market")).lower()
+    sym = mt5_symbol(order, cfg)
+    if order.get("notional") is not None:
+        return None, "MetaTrader needs a share count (qty), not a dollar amount (notional)"
+    if typ not in ("market", "limit", "stop"):
+        return None, "order type %s is not supported on MetaTrader here (market, limit or stop only)" % typ
+    lots, problem = mt5_volume(order.get("qty"), cfg)
+    if problem:
+        return None, problem
+    kind = kind or ("entry" if side == "buy" else "exit")
+    if side == "sell" and kind == "exit":
+        if typ != "market":
+            return None, "on MetaTrader an exit closes the position at market; use a market sell"
+        return [
+            {"tool": "get_positions_by_symbol", "input": {"symbol": sym},
+             "why": "find the open %s position and check its volume is %s lots" % (sym, _str_num(lots))},
+            {"tool": "close_position", "input": {"id": MT5_HELD_ID},
+             "why": "closes it; its stop-loss and take-profit go with it"},
+        ], None
+    if side != "buy":
+        return None, "short selling is not supported on MetaTrader here: a SELL would open a short"
+    sl = _f(order.get("stop_loss_stop_price"))
+    tp = _f(order.get("take_profit_limit_price"))
+    if typ in ("limit", "stop"):
+        price = _f(order.get("limit_price") if typ == "limit" else order.get("stop_price"))
+        if not price:
+            return None, "a %s order needs its price" % typ
+        inp = {"symbol": sym, "volume": lots, "type": "BUY", "price": price}
+        if sl:
+            inp["stop_loss"] = sl
+        if tp:
+            inp["take_profit"] = tp
+        return [{"tool": "place_pending_order", "input": inp,
+                 "why": "the entry waits at %s with its stop and target attached" % _p(price)}], None
+    steps = [{"tool": "place_market_order", "input": {"symbol": sym, "volume": lots, "type": "BUY"},
+              "why": "the entry, at market"}]
+    if sl or tp:
+        mod = {"id": MT5_POS_ID}
+        if sl:
+            mod["stop_loss"] = sl
+        if tp:
+            mod["take_profit"] = tp
+        steps += [
+            {"tool": "get_positions_by_symbol", "input": {"symbol": sym},
+             "why": "the new position's id"},
+            {"tool": "modify_position", "input": mod,
+             "why": "attaches the stop and the target right away; if this fails, close the position"},
+        ]
+    return steps, None
+
+
 def _money(v):
     f = float(v)
     s = "{:,.2f}".format(f)
@@ -349,12 +459,27 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today):
+def gate(order, cfg, risk, state, today):
+    """status_of, plus the MetaTrader translation: an order MetaTrader cannot
+    take exactly as trader-risk checked it is never READY."""
     ready, label, rv = status_of(order, risk, state, today)
+    steps = None
+    if is_mt5(cfg):
+        steps, problem = mt5_steps(order, cfg, kind_of(order, rv))
+        if problem:
+            return False, "NOT READY for MetaTrader: " + problem, rv, None
+    return ready, label, rv, steps
+
+
+def render(order, idx, total, cfg, risk, state, today):
+    ready, label, rv, steps = gate(order, cfg, risk, state, today)
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
-    acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    if is_mt5(cfg):
+        acct = "DEMO account" if paper else "LIVE ACCOUNT, REAL MONEY"
+    else:
+        acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, broker_name(cfg))]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -362,7 +487,20 @@ def render(order, idx, total, cfg, risk, state, today):
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
-    if broker == "ibkr":
+    if is_mt5(cfg):
+        if steps:
+            lines.append("  Claude will make these MetaTrader calls, in this order:")
+            for n, s in enumerate(steps, 1):
+                lines.append("    %d. %s %s" % (n, s["tool"], json.dumps(s["input"])))
+                lines.append("       (%s)" % s["why"])
+            if any(s["tool"] == "place_market_order" for s in steps) and len(steps) > 1:
+                lines.append("  Between steps 1 and 3 the position has no stop at the broker, for a few seconds.")
+            if any(s["tool"] == "place_pending_order" for s in steps):
+                lines.append("  The pending order stays until it fills or is canceled: cancel it by flat_by.")
+            if str(order.get("side", "")).lower() == "buy":
+                lines.append("  MetaTrader trades this as a CFD on margin. Prices and the max loss are in the")
+                lines.append("  symbol's currency (USD); your account converts them at your broker's rate.")
+    elif broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
     else:
@@ -380,13 +518,18 @@ def render(order, idx, total, cfg, risk, state, today):
 
 
 def ticket_json(order, idx, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv, steps = gate(order, cfg, risk, state, today)
     loss, stop = max_loss(order)
-    return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
-            "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
-            "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
-            "tool_input": tool_input(order), "why": order.get("why", ""),
-            "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    out = {"index": idx, "ready": ready, "status": label, "plain": plain(order),
+           "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
+           "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
+           "tool_input": tool_input(order), "why": order.get("why", ""),
+           "bracket": is_bracket(order), "max_loss": loss, "stop": stop}
+    if is_mt5(cfg):
+        out["tool"] = "metatrader"
+        out["tool_input"] = None
+        out["mt5_steps"] = steps
+    return out
 
 
 # ---------------------------------------------------------------- fills -> portfolio
@@ -500,7 +643,7 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now = _load(a)
     order = _pick(orders, a.index)
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv, steps = gate(order, cfg, risk, state, today)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])
@@ -518,6 +661,12 @@ def cmd_approve(a):
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+    elif is_mt5(cfg):
+        print("Now make these MetaTrader calls, in order, with exactly these inputs:")
+        for n, s in enumerate(steps, 1):
+            print("  %d. %s %s" % (n, s["tool"], json.dumps(s["input"])))
+        print("Each order call shows Claude's card: Allow once / Deny. Then: ticket.py result --index %d "
+              "--status placed|denied|failed (--broker-id is the position id)" % a.index)
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
@@ -622,6 +771,10 @@ def cmd_flatten(a):
     print("  1. trader-risk: check.py. A sell that only closes what you hold is never blocked by the daily")
     print("     limits or the entry window.")
     print("  2. ticket.py show, then the user's yes for this one order.")
+    if is_mt5(cfg):
+        print("  3. MetaTrader: get_positions_by_symbol %s for the position id and volume, then close_position" % sym)
+        print("     with that id (Needs approval). Its stop-loss and take-profit close with it.")
+        return 0
     print("  3. If the bracket's stop-loss and take-profit are still open, Alpaca holds these shares for them")
     print("     and rejects a new sell. Cancel them first: get_orders (status open, nested true), then")
     print("     cancel_order_by_id for each open leg (Needs approval). Then place_stock_order with the ticket.")

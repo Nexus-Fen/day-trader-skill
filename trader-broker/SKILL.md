@@ -10,7 +10,9 @@ description: >-
   and logs each trade's max loss so trader-risk can hold the daily limit.
   Covers setting up Alpaca's official MCP server in Claude Desktop (paper by
   default, keys in env vars, never in chat), the Interactive Brokers
-  connector, and setting order tools to "Needs approval". Use when the user
+  connector, a MetaTrader 5 demo account (lots, stop attached by
+  modify_position, exits by close_position), and setting order tools to
+  "Needs approval". Use when the user
   says "place the order", "buy it", "execute", "send it to my broker",
   "close my position", "flatten", "get me out", "connect Alpaca", "set up
   paper trading", or after /trader-risk passes.
@@ -135,6 +137,65 @@ submits orders directly to the market. So with IBKR the final yes happens in
 IBKR as well. Set `"broker": "ibkr"` in `trader/config.json`. Set its tools
 that draft orders to Needs approval too.
 
+## Setup C: MetaTrader 5 (demo account)
+
+For a MetaTrader 5 terminal connected through a MetaTrader MCP server (tools
+named `place_market_order`, `place_pending_order`, `modify_position`,
+`close_position`, `get_positions_by_symbol`, `get_account_info`...).
+
+1. **Demo only.** Log the terminal into a demo account. Then merge
+   `config.mt5.example.json` (next to this file) into `trader/config.json`:
+   `"broker": "mt5"`, `"paper": true`, and the `"mt5"` block.
+2. **Contract size.** In MetaTrader, right-click the symbol in Market Watch,
+   Specification. Copy Contract size, Volume step and Volume min into
+   `"mt5"`. Without `contract_size` no ticket is READY: shares cannot be
+   turned into lots, and a wrong size makes the max loss wrong. If the
+   broker's name differs (`TSLA.US`), add it to `symbol_map`.
+3. **Add the symbol to Market Watch** so it has prices. A price of 0 or a
+   time in 1970 from `get_symbol_price` means it is not there yet.
+4. **Tool permissions**, as for Alpaca: `place_market_order`,
+   `place_pending_order`, `modify_position`, `modify_pending_order`,
+   `close_position`, `cancel_pending_order`: **Needs approval**.
+   `close_all_positions`, `close_all_profitable_positions`,
+   `close_all_losing_positions`, `close_all_positions_by_symbol`,
+   `cancel_all_pending_orders`, `cancel_pending_orders_by_symbol`: **Blocked**.
+   Read-only tools (`get_*`): Always allow is fine.
+5. **Check the account at the start of each session** with `get_account_info`.
+   Some MetaTrader servers report a demo account as `"account_type": "real"`.
+   If it says real while the config says `"paper": true`, tell the user and
+   wait for them to confirm in the chat, this session, that the terminal is on
+   the demo account. Never go on without that.
+
+How tickets differ on MetaTrader (`ticket.py show` prints the exact calls):
+
+- **Volume in lots**: qty / contract_size, exactly on the step. An order that
+  does not land on the step is NOT READY, never rounded: rounding would change
+  the max loss trader-risk checked.
+- **Market entry with a stop**: three calls. `place_market_order` (BUY), then
+  `get_positions_by_symbol` for the new position's id, then `modify_position`
+  with that id, the stop-loss and the take-profit, straight away. The position
+  has no stop at the broker for those few seconds. If `modify_position` fails,
+  tell the user and propose closing the position (`close_position`, with its
+  own yes).
+- **Limit or stop entry**: one `place_pending_order` with `stop_loss` and
+  `take_profit` attached. It stays until filled or canceled: cancel it
+  (`cancel_pending_order`) by flat_by if it has not filled.
+- **Exits never send a SELL.** On MetaTrader a SELL with nothing to close opens
+  a short. An exit is `get_positions_by_symbol`, check the volume, then
+  `close_position` with the id. Its stop and target close with it. A sell that
+  is not closing a position is refused.
+- **CFDs on margin.** MetaTrader trades these as CFDs with the broker's
+  leverage, even though the config says no margin. The sizing still bounds
+  the loss at the stop to `max_loss_per_trade_usd`. Prices and the max loss
+  are in USD; an account in EUR converts at the broker's rate.
+- **Prices**: the pack's quotes come from Yahoo and can differ from the
+  broker's. Before the yes, compare with `get_symbol_price` and say so if the
+  gap moves the entry, stop or target.
+- **Time**: everything is New York time. Paris is 6 hours ahead most of the
+  year (5 hours for a few weeks in March and late October to early November,
+  when the clocks change on different dates).
+- `ticket.py result --broker-id` takes the MetaTrader position id.
+
 ## Steps: the entry
 
 1. `ticket.py show`. Only READY tickets go to the user. A ticket that is NOT
@@ -147,6 +208,8 @@ that draft orders to Needs approval too.
    stock or amount). Ask again. Never turn a reply into a yes yourself.
 4. Only after "Recorded your yes", call `place_stock_order` with exactly the
    JSON the ticket printed. Claude's card appears: Allow once or Deny.
+   On MetaTrader, make the calls the ticket lists, in order, with exactly
+   those inputs (Setup C).
 5. Record what happened: `ticket.py result --index N --status placed
    --broker-id <id> --filled-qty Q --filled-price P` (the fill from the
    response or `get_open_position`), or `--status denied`, or `--status failed`

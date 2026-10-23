@@ -1,0 +1,11 @@
+{
+  "broker": "mt5",
+  "paper": true,
+  "mt5": {
+    "contract_size": null,
+    "volume_step": 0.01,
+    "volume_min": 0.01,
+    "symbol_map": {}
+  },
+  "_comment": "Merge these keys into trader/config.json. contract_size is required: MetaTrader, right-click the symbol in Market Watch, Specification, Contract size. Copy volume_step and volume_min from the same window. symbol_map renames tickers when your broker uses a suffix, for example {\"TSLA\": \"TSLA.US\"}. \"paper\": true means a DEMO account."
+}
