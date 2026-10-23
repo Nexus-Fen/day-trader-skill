@@ -498,8 +498,10 @@ def render(order, idx, total, cfg, risk, state, today):
             if any(s["tool"] == "place_pending_order" for s in steps):
                 lines.append("  The pending order stays until it fills or is canceled: cancel it by flat_by.")
             if str(order.get("side", "")).lower() == "buy":
-                lines.append("  MetaTrader trades this as a CFD on margin. Prices and the max loss are in the")
-                lines.append("  symbol's currency (USD); your account converts them at your broker's rate.")
+                if (cfg.get("mt5") or {}).get("cfd"):
+                    lines.append("  MetaTrader trades this as a CFD on margin, at your broker's leverage.")
+                lines.append("  Prices and the max loss are in the symbol's currency (USD); your account")
+                lines.append("  converts them at your broker's rate.")
     elif broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
