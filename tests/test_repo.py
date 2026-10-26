@@ -42,7 +42,7 @@ class Repo(unittest.TestCase):
         # trader/ is the skills' own working folder (config, orders, logs): local and git-ignored
         root = sorted(d for d in os.listdir(ROOT) if not d.startswith(".git") and d not in ("trader", "__pycache__"))
         # fork Nexus-Fen: + docs/ (the French guide) and tradingview/ (the Pine scripts)
-        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "docs", "tests", "tradingview"] + SKILLS))
+        self.assertEqual(root, sorted([".claude-plugin", "LICENSE", "README.md", "docs", "research", "tests", "tradingview"] + SKILLS))
 
     def test_frontmatter_name_and_description(self):
         for s in SKILLS:
