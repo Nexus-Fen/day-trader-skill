@@ -1,0 +1,203 @@
+//@version=6
+// ORB Day Trader : l'indicateur en direct de la stratégie du skill day-trader-skill
+// (fork Nexus-Fen, branche mt5-demo). Il dessine le range, le signal, le stop et l'objectif,
+// et envoie des alertes. Il ne passe aucun ordre.
+//
+// Mêmes règles que les scripts Python et que orb_strategy.pine :
+//   - range d'ouverture = plus haut / plus bas de 9:30 à 9:45 (New York)
+//   - signal = la PREMIÈRE bougie terminée qui CLÔTURE au-dessus du haut du range,
+//     si elle clôture entre 09:45 et 15:30 New York
+//   - stop = milieu du range (arrondi vers le bas), objectif = 1R, à plat à 15:55
+//   - taille = perte max par trade / risque par action, arrondie vers le bas
+//
+// Alertes : créer une alerte sur cet indicateur avec « Tout appel de fonction alert() »
+// (message complet avec la quantité, le stop et l'objectif), ou choisir une des
+// conditions « ORB : ... ». Graphique en 5 minutes, séance régulière.
+// Ce n'est pas un conseil financier.
+
+indicator("ORB Day Trader (signaux)", shorttitle = "ORB DTS", overlay = true, max_labels_count = 500)
+
+// ---------------------------------------------------------------- réglages
+grpR = "Range d'ouverture"
+orMinutes = input.int(15, "Durée du range (minutes)", minval = 5, maxval = 60, step = 5, group = grpR)
+
+grpE = "Entrée"
+entryFrom = input.string("09:45", "Pas d'entrée avant (heure de New York)", group = grpE)
+entryTo   = input.string("15:30", "Pas d'entrée après (heure de New York)", group = grpE)
+minVolX   = input.float(0.0, "Volume mini de la bougie (x volume moyen du range, 0 = sans filtre)", minval = 0, step = 0.1, group = grpE)
+
+grpX = "Sortie"
+stopMode = input.string("Milieu du range", "Stop", options = ["Milieu du range", "Bas du range", "Pourcentage"], group = grpX)
+stopPct  = input.float(1.0, "Stop en % sous l'entrée (si Pourcentage)", minval = 0.1, step = 0.1, group = grpX)
+targetR  = input.float(1.0, "Objectif (multiple du risque R)", minval = 0.5, step = 0.5, group = grpX)
+flatBy   = input.string("15:55", "À plat avant (heure de New York)", group = grpX)
+
+grpS = "Taille et risque"
+maxLoss  = input.float(50, "Perte max par trade ($)", minval = 1, group = grpS)
+maxOrder = input.float(4000, "Montant max par ordre ($)", minval = 1, group = grpS)
+
+grpD = "Affichage"
+showTable = input.bool(true, "Tableau du jour", group = grpD)
+
+// ---------------------------------------------------------------- outils
+TZ = "America/New_York"
+OPEN_MIN = 9 * 60 + 30
+
+toMin(string s) =>
+    array<string> parts = str.split(s, ":")
+    int result = na
+    if array.size(parts) == 2
+        float h = str.tonumber(array.get(parts, 0))
+        float m = str.tonumber(array.get(parts, 1))
+        if not na(h) and not na(m)
+            result := int(h) * 60 + int(m)
+    result
+
+floorTick(float x) => math.floor(x / syminfo.mintick + 1e-9) * syminfo.mintick
+roundTick(float x) => math.round(x / syminfo.mintick) * syminfo.mintick
+fmt(float x) => str.tostring(x, format.mintick)
+
+int fromMin = toMin(entryFrom)
+int toMinV  = toMin(entryTo)
+int flatMin = toMin(flatBy)
+if na(fromMin) or na(toMinV) or na(flatMin)
+    runtime.error("Heures au format HH:MM, par exemple 09:45")
+if not timeframe.isintraday or timeframe.in_seconds() > orMinutes * 60 or (orMinutes * 60) % timeframe.in_seconds() != 0
+    runtime.error("Utilisez une unité de temps intraday qui divise la durée du range : 5 minutes conseillé.")
+
+int barStart = hour(time, TZ) * 60 + minute(time, TZ)
+int barEnd   = hour(time_close, TZ) * 60 + minute(time_close, TZ)
+int nyDay    = year(time, TZ) * 10000 + month(time, TZ) * 100 + dayofmonth(time, TZ)
+bool newDay  = nyDay != nyDay[1]
+int orEnd    = OPEN_MIN + orMinutes
+
+// ---------------------------------------------------------------- état du jour
+var float orHigh   = na
+var float orLow    = na
+var float orVolSum = 0.0
+var int   orBars   = 0
+var bool  traded   = false
+var bool  inPos    = false
+var float entryPx  = na
+var float stopPx   = na
+var float tgtPx    = na
+var int   qtyDay   = na
+var string note    = ""
+
+if newDay
+    orHigh   := na
+    orLow    := na
+    orVolSum := 0.0
+    orBars   := 0
+    traded   := false
+    inPos    := false
+    entryPx  := na
+    stopPx   := na
+    tgtPx    := na
+    qtyDay   := na
+    note     := ""
+
+// ---------------------------------------------------------------- le range
+bool inOr = barStart >= OPEN_MIN and barStart < orEnd
+if inOr
+    orHigh   := na(orHigh) ? high : math.max(orHigh, high)
+    orLow    := na(orLow) ? low : math.min(orLow, low)
+    orVolSum += volume
+    orBars   += 1
+bool orReady = orBars > 0 and barStart >= orEnd
+float orMid  = (roundTick(orHigh) + roundTick(orLow)) / 2
+
+// ---------------------------------------------------------------- la position simulée
+// Le stop est testé avant l'objectif : si une bougie touche les deux, on compte une perte (prudent).
+bool hitStop   = false
+bool hitTarget = false
+bool hitFlat   = false
+if inPos
+    if low <= stopPx
+        hitStop := true
+        inPos := false
+        note := "Stop touché à " + fmt(stopPx) + " : " + str.tostring(-qtyDay * (entryPx - stopPx), "#.##") + " $"
+    else if high >= tgtPx
+        hitTarget := true
+        inPos := false
+        note := "Objectif touché à " + fmt(tgtPx) + " : +" + str.tostring(qtyDay * (tgtPx - entryPx), "#.##") + " $"
+    else if barEnd >= flatMin
+        hitFlat := true
+        inPos := false
+        note := "À plat à " + flatBy + " à " + fmt(close) + " : " + str.tostring(qtyDay * (close - entryPx), "#.##") + " $"
+
+// ---------------------------------------------------------------- le signal
+float avgOrVol = orBars > 0 ? orVolSum / orBars : na
+bool volOk     = minVolX <= 0 or (avgOrVol > 0 and volume >= minVolX * avgOrVol)
+bool inWindow  = barEnd >= fromMin and barEnd <= toMinV
+bool trigger   = orReady and not traded and inWindow and close > orHigh and volOk
+
+bool entered = false
+if trigger
+    traded := true
+    float e = roundTick(close)
+    float s = stopMode == "Milieu du range" ? floorTick(orMid) : stopMode == "Bas du range" ? floorTick(roundTick(orLow)) : floorTick(e * (1 - stopPct / 100))
+    float risk = e - s
+    if risk <= 0 or risk < e * 0.0005
+        note := "Signal refusé : stop trop proche (moins de 0,05 % du prix)"
+    else
+        float t = roundTick(e + targetR * risk)
+        int q = math.min(math.floor(maxLoss / risk), math.floor(maxOrder / e))
+        if q < 1
+            note := "Signal refusé : le risque d'une action dépasse la perte max"
+        else
+            entryPx := e
+            stopPx  := s
+            tgtPx   := t
+            qtyDay  := q
+            inPos   := true
+            entered := true
+            note    := "Signal : en position"
+            label.new(bar_index, low, "ORB " + str.tostring(q) + " @ " + fmt(e) + "\nStop " + fmt(s) + "\nObjectif " + fmt(t) + "\nPerte max " + str.tostring(q * risk, "#.##") + " $", style = label.style_label_up, color = color.new(color.green, 15), textcolor = color.white, size = size.small)
+            alert("ORB " + syminfo.ticker + " : signal d'achat " + str.tostring(q) + " @ " + fmt(e) + ", stop " + fmt(s) + ", objectif " + fmt(t) + ", perte max " + str.tostring(q * risk, "#.##") + " $", alert.freq_once_per_bar_close)
+
+if hitStop
+    alert("ORB " + syminfo.ticker + " : stop touché à " + fmt(stopPx), alert.freq_once_per_bar)
+if hitTarget
+    alert("ORB " + syminfo.ticker + " : objectif touché à " + fmt(tgtPx), alert.freq_once_per_bar)
+if hitFlat
+    alert("ORB " + syminfo.ticker + " : " + flatBy + " New York, fermer la position", alert.freq_once_per_bar_close)
+
+alertcondition(entered, "ORB : signal d'achat", "ORB {{ticker}} : clôture au-dessus du haut du range à {{close}}")
+alertcondition(hitStop, "ORB : stop touché", "ORB {{ticker}} : stop touché")
+alertcondition(hitTarget, "ORB : objectif touché", "ORB {{ticker}} : objectif touché")
+alertcondition(hitFlat, "ORB : à plat avant la clôture", "ORB {{ticker}} : heure de fermer la position")
+
+// ---------------------------------------------------------------- dessin
+bool showRange = not na(orHigh) and barStart < flatMin
+plot(showRange ? orHigh : na, "Haut du range", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 2)
+plot(showRange ? orLow : na, "Bas du range", color = color.new(color.teal, 0), style = plot.style_linebr, linewidth = 2)
+plot(showRange and orReady ? orMid : na, "Milieu du range", color = color.new(color.gray, 30), style = plot.style_linebr)
+bool showPlan = not na(entryPx) and barStart < flatMin
+plot(showPlan ? stopPx : na, "Stop", color = color.new(color.red, 0), style = plot.style_linebr, linewidth = 2)
+plot(showPlan ? tgtPx : na, "Objectif", color = color.new(color.green, 0), style = plot.style_linebr, linewidth = 2)
+bgcolor(inOr ? color.new(color.teal, 88) : na, title = "Range en formation")
+plotshape(entered, "Signal ORB", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small)
+plotshape(hitStop, "Stop touché", shape.xcross, location.abovebar, color.new(color.red, 0), size = size.small)
+plotshape(hitTarget, "Objectif touché", shape.diamond, location.abovebar, color.new(color.green, 0), size = size.small)
+plotshape(hitFlat, "À plat", shape.square, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+
+var table tb = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
+if showTable and barstate.islast
+    string st = na(orHigh) ? "En attente de 09:30 New York" : not orReady ? "Range en formation" : note != "" ? note : barEnd > toMinV ? "Pas de signal aujourd'hui" : "Attend une clôture > " + fmt(orHigh)
+    table.cell(tb, 0, 0, "ORB " + syminfo.ticker, text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 0, st, text_color = color.yellow, text_size = size.small)
+    table.cell(tb, 0, 1, "Range", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 1, na(orHigh) ? "-" : fmt(orLow) + " - " + fmt(orHigh), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 2, "Entrée", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 2, na(entryPx) ? "-" : fmt(entryPx), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 3, "Stop", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 3, na(stopPx) ? "-" : fmt(stopPx), text_color = color.red, text_size = size.small)
+    table.cell(tb, 0, 4, "Objectif", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 4, na(tgtPx) ? "-" : fmt(tgtPx), text_color = color.green, text_size = size.small)
+    table.cell(tb, 0, 5, "Quantité", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 5, na(qtyDay) ? "-" : str.tostring(qtyDay), text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 6, "Perte max", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 6, na(qtyDay) ? "-" : str.tostring(qtyDay * (entryPx - stopPx), "#.##") + " $", text_color = color.white, text_size = size.small)
+    table.cell(tb, 0, 7, "À plat", text_color = color.white, text_size = size.small)
+    table.cell(tb, 1, 7, flatBy + " New York", text_color = color.white, text_size = size.small)
