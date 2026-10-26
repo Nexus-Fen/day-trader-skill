@@ -26,6 +26,8 @@ grpE = "Entrée"
 entryFrom = input.string("09:45", "Pas d'entrée avant (heure de New York)", group = grpE)
 entryTo   = input.string("15:30", "Pas d'entrée après (heure de New York)", group = grpE)
 minVolX   = input.float(0.0, "Volume mini de la bougie (x volume moyen du range, 0 = sans filtre)", minval = 0, step = 0.1, group = grpE)
+useSpy    = input.bool(false, "Filtre marché : seulement si SPY est au-dessus de son ouverture", group = grpE)
+spySym    = input.symbol("AMEX:SPY", "Indice de référence du filtre", group = grpE)
 
 grpX = "Sortie"
 stopMode = input.string("Milieu du range", "Stop", options = ["Milieu du range", "Bas du range", "Pourcentage"], group = grpX)
@@ -118,7 +120,16 @@ float orMid  = (roundTick(orHigh) + roundTick(orLow)) / 2
 float avgOrVol = orBars > 0 ? orVolSum / orBars : na
 bool volOk     = minVolX <= 0 or (avgOrVol > 0 and volume >= minVolX * avgOrVol)
 bool inWindow  = barEnd >= fromMin and barEnd <= toMinV
-bool trigger   = active and orReady and not traded and inWindow and close > orHigh and volOk and strategy.position_size == 0
+// Filtre marché : le premier signal du jour n'est pris que si SPY monte depuis l'ouverture.
+// Sinon la journée est sautée (pas d'attente d'un signal plus tard), comme dans l'étude.
+float spyOpen = request.security(spySym, "D", open, lookahead = barmerge.lookahead_on)
+float spyNow  = request.security(spySym, timeframe.period, close)
+bool spyOk    = not useSpy or (not na(spyNow) and not na(spyOpen) and spyNow > spyOpen)
+bool breakout = active and orReady and not traded and inWindow and close > orHigh and volOk and strategy.position_size == 0
+bool trigger  = breakout and spyOk
+if breakout and not spyOk
+    traded := true
+    note := "Signal ignoré : SPY sous son ouverture"
 
 bool entered = false
 if trigger
