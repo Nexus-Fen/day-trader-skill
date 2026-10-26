@@ -62,10 +62,11 @@ fmt(float x) => str.tostring(x, format.mintick)
 int fromMin = toMin(entryFrom)
 int toMinV  = toMin(entryTo)
 int flatMin = toMin(flatBy)
-if na(fromMin) or na(toMinV) or na(flatMin)
-    runtime.error("Heures au format HH:MM, par exemple 09:45")
-if not timeframe.isintraday or timeframe.in_seconds() > orMinutes * 60 or (orMinutes * 60) % timeframe.in_seconds() != 0
-    runtime.error("Utilisez une unité de temps intraday qui divise la durée du range : 5 minutes conseillé.")
+// Réglages invalides : pas d'erreur, le script s'arrête proprement et le tableau explique pourquoi.
+bool hoursOk = not na(fromMin) and not na(toMinV) and not na(flatMin)
+bool tfOk    = timeframe.isintraday and timeframe.in_seconds() <= orMinutes * 60 and (orMinutes * 60) % timeframe.in_seconds() == 0
+string setupMsg = not tfOk ? "Passez le graphique en 5 minutes (unité actuelle : " + timeframe.period + ")" : not hoursOk ? "Heures au format HH:MM, par exemple 09:45" : ""
+bool active  = tfOk and hoursOk
 
 int barStart = hour(time, TZ) * 60 + minute(time, TZ)
 int barEnd   = hour(time_close, TZ) * 60 + minute(time_close, TZ)
@@ -104,7 +105,7 @@ if newDay
     note     := ""
 
 // ---------------------------------------------------------------- le range
-bool inOr = barStart >= OPEN_MIN and barStart < orEnd
+bool inOr = active and barStart >= OPEN_MIN and barStart < orEnd
 if inOr
     orHigh   := na(orHigh) ? high : math.max(orHigh, high)
     orLow    := na(orLow) ? low : math.min(orLow, low)
@@ -117,7 +118,7 @@ float orMid  = (roundTick(orHigh) + roundTick(orLow)) / 2
 float avgOrVol = orBars > 0 ? orVolSum / orBars : na
 bool volOk     = minVolX <= 0 or (avgOrVol > 0 and volume >= minVolX * avgOrVol)
 bool inWindow  = barEnd >= fromMin and barEnd <= toMinV
-bool trigger   = orReady and not traded and inWindow and close > orHigh and volOk and strategy.position_size == 0
+bool trigger   = active and orReady and not traded and inWindow and close > orHigh and volOk and strategy.position_size == 0
 
 bool entered = false
 if trigger
@@ -160,8 +161,8 @@ bgcolor(inOr ? color.new(color.teal, 88) : na, title = "Range en formation")
 plotshape(entered, "Signal ORB", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.small)
 
 var table tb = table.new(position.top_right, 2, 8, bgcolor = color.new(color.black, 20), border_width = 1)
-if showTable and barstate.islast
-    string st = na(orHigh) ? "En attente de 09:30 New York" : not orReady ? "Range en formation" : note != "" ? note : barEnd > toMinV ? "Pas de signal aujourd'hui" : "Attend une clôture > " + fmt(orHigh)
+if (showTable or setupMsg != "") and barstate.islast
+    string st = setupMsg != "" ? setupMsg : na(orHigh) ? "En attente de 09:30 New York" : not orReady ? "Range en formation" : note != "" ? note : barEnd > toMinV ? "Pas de signal aujourd'hui" : "Attend une clôture > " + fmt(orHigh)
     table.cell(tb, 0, 0, "ORB " + syminfo.ticker, text_color = color.white, text_size = size.small)
     table.cell(tb, 1, 0, st, text_color = color.yellow, text_size = size.small)
     table.cell(tb, 0, 1, "Range", text_color = color.white, text_size = size.small)
